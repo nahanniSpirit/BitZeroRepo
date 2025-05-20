@@ -1,0 +1,29 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyd
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Virtual environment
+.venv/
+venv/
+env/
+# These are common names for virtual environment folders, add any you use.
+
+# Editor specific files
+.vscode/ # VS Code settings
+.idea/   # PyCharm/IntelliJ IDEA settings
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Logs and databases
+*.log
+*.sqlite3
+*.db.sqlite3
+
+# Environment variables (e.g., for API keys)
+.env
