@@ -5,11 +5,12 @@ This module implements optimized training for BitZero with batch processing,
 GPU acceleration, and other performance enhancements, including the ability
 to load and train from a JSONL dataset.
 
-MODIFIED: 
-    - Corrected target for dynamic code tasks and added debug print for it.
-    - Re-added get_next_task_from_cache method.
+MODIFIED:
+    - Implemented a robust conversation packing and causal masking strategy for training
+      on conversational data, ensuring proper handling of max_seq_len limits.
     - Added Learning Rate Scheduler (OneCycleLR) - Recommendation 4.2.
     - Added Progressive Batch Size Scaling (get_optimal_batch_size) - Recommendation 4.1.
+    - FIXED: AttributeError when accessing self.verbose in threaded data preparation.
 """
 
 import torch
@@ -37,6 +38,7 @@ try:
     )
 except ImportError:
     print("ERROR: tokenizer_config.py not found. This script requires it.")
+    # Minimal fallback to prevent immediate crash, but training will be broken.
     VOCAB_SIZE = 150 
     CHAR_TO_ID = {chr(i): i for i in range(150)} 
     ID_TO_CHAR = {i: chr(i) for i in range(150)} 
@@ -48,10 +50,14 @@ except ImportError:
 class OptimizedTrainer:
     """Optimized trainer for BitZero with batch processing and GPU acceleration."""
     
+    # Define a minimum number of tokens for the target/label part of a sequence
+    # This prevents training on examples where the assistant's response is too short after truncation.
+    MIN_TARGET_LEN_FOR_TRAINING = 3 
+
     def __init__(self, 
                  model_size: str = "nano",
                  device: str = "cuda" if torch.cuda.is_available() else "cpu",
-                 initial_batch_size: int = 8, # Defaulting to a safer initial
+                 initial_batch_size: int = 8, 
                  learning_rate: float = 1e-5, 
                  max_seq_len: int = 768, 
                  use_mixed_precision: bool = True,
@@ -65,8 +71,9 @@ class OptimizedTrainer:
                  num_epochs_for_scheduler: int = 5, 
                  total_steps_for_scheduler: Optional[int] = None,
                  weight_decay_for_adamw: float = 0.01,
-                 vram_per_sample_gb_estimate: float = 0.2, # INCREASED default estimate
-                 max_dynamic_batch_size: int = 32 # REDUCED default cap
+                 vram_per_sample_gb_estimate: float = 0.2, 
+                 max_dynamic_batch_size: int = 32,
+                 verbose: bool = False # Make sure verbose is stored
                  ): 
         self.model_size = model_size
         self.batch_size = initial_batch_size 
@@ -86,7 +93,8 @@ class OptimizedTrainer:
         self.weight_decay_for_adamw = weight_decay_for_adamw
         self.vram_per_sample_gb_estimate = vram_per_sample_gb_estimate 
         self.max_dynamic_batch_size = max_dynamic_batch_size 
-        
+        self.verbose = verbose # Store verbose flag
+
         os.makedirs(checkpoint_dir, exist_ok=True)
         os.makedirs(log_dir, exist_ok=True)
         
@@ -164,18 +172,14 @@ class OptimizedTrainer:
             current_usage_gb = torch.cuda.memory_allocated() / 1e9
             total_vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
             
-            reserved_vram_gb = 1.0 # INCREASED fixed reservation
+            reserved_vram_gb = 1.0 # Increased fixed reservation for safety
             available_vram_gb = total_vram_gb - current_usage_gb - reserved_vram_gb
             
-            # print(f"VRAM Check: Total={total_vram_gb:.2f}GB, Used={current_usage_gb:.2f}GB, Reserved={reserved_vram_gb:.2f}GB, AvailableForBatch={available_vram_gb:.2f}GB")
-
             if available_vram_gb <= 0.2: # Stricter threshold for reducing batch size
                 new_batch_size = max(1, self.batch_size // 2) 
-                # print(f"VRAM Tight! Available: {available_vram_gb:.2f} GB. Reducing batch size to: {new_batch_size}")
                 return new_batch_size
 
             if self.vram_per_sample_gb_estimate <= 0:
-                # print(f"vram_per_sample_gb_estimate is invalid. Using initial batch size: {self.initial_batch_size}")
                 return self.initial_batch_size
 
             calculated_optimal_size = int(available_vram_gb / self.vram_per_sample_gb_estimate)
@@ -183,10 +187,8 @@ class OptimizedTrainer:
             # If this is an early estimate (low current usage), be more cautious
             if current_usage_gb < total_vram_gb * 0.4: # If less than 40% VRAM used
                 calculated_optimal_size = int(calculated_optimal_size * 0.70) # Reduce by 30%
-                # print(f"Early estimate, applying cautious reduction. New calculated: {calculated_optimal_size}")
 
             optimal_batch_size = max(1, min(calculated_optimal_size, self.max_dynamic_batch_size))
-            # print(f"Est. Optimal BS: {optimal_batch_size} (from calc: {calculated_optimal_size}, current actual BS: {self.batch_size})")
             return optimal_batch_size
 
         except Exception as e:
@@ -198,19 +200,16 @@ class OptimizedTrainer:
         """Configures the OneCycleLR scheduler."""
         if self.scheduler is None: 
             if self.total_steps_for_scheduler is None:
-                 # Make total_steps slightly more generous to accommodate batch size fluctuations
-                 # Or, if using dataset, calculate more precisely based on initial_batch_size
                 if self.dataset_path and self.full_dataset_cache and self.initial_batch_size > 0:
                     precise_batches_per_epoch = (len(self.full_dataset_cache) + self.initial_batch_size - 1) // self.initial_batch_size
                     self.total_steps_for_scheduler = num_epochs * precise_batches_per_epoch
-                else: # Dynamic tasks or unknown dataset size initially
+                else: 
                     self.total_steps_for_scheduler = num_epochs * estimated_batches_per_epoch 
                 
-                # Add a small buffer if calculated, or ensure a minimum if it's very low
                 if self.total_steps_for_scheduler > 0 :
-                    self.total_steps_for_scheduler = int(self.total_steps_for_scheduler * 1.1) + 1 # Add 10% buffer + 1
-                else: # Fallback if calculation is zero (e.g. estimated_batches_per_epoch was 0)
-                    self.total_steps_for_scheduler = num_epochs * 100 # A reasonable minimum per epoch
+                    self.total_steps_for_scheduler = int(self.total_steps_for_scheduler * 1.1) + 1 
+                else: 
+                    self.total_steps_for_scheduler = num_epochs * 100 
 
             if self.total_steps_for_scheduler <= 0:
                 print("Warning: total_steps_for_scheduler is 0 or less. Scheduler will not be effective.")
@@ -272,72 +271,6 @@ class OptimizedTrainer:
         print(f"Max VRAM usage: {max_memory:.2f} GB")
         if not model_on_cuda or not output_on_cuda: print("WARNING: Some operations are not on CUDA!")
 
-    def _split_sequence_dynamically(self, sequence: List[int]) -> List[List[int]]:
-        """
-        Splits a token sequence dynamically based on its length.
-        Rules:
-        - Length <= 1000: No split (1 chunk)
-        - 1001 <= Length <= 1999: Split into 2 chunks
-        - 2000 <= Length <= 3000: Split into 3 chunks
-        - Length > 3000: ValueError
-        If the original sequence ended with EOS, ensures all chunks also end with EOS.
-        """
-        n = len(sequence)
-        eos_token_id = CHAR_TO_ID.get(EOS_TOKEN)
-
-        if not isinstance(sequence, list):
-            raise TypeError("Input sequence must be a list of integers.")
-
-        if eos_token_id is None:
-            # This should ideally not happen if tokenizer_config is loaded.
-            print("Warning: EOS_TOKEN not found in CHAR_TO_ID for _split_sequence_dynamically.")
-            # Fallback or raise error, for now, proceed without EOS guarantee if not found
-            original_sequence_had_eos_at_end = False
-        else:
-            original_sequence_had_eos_at_end = (n > 0 and sequence[-1] == eos_token_id)
-
-        if n == 0:
-            return []
-
-        if n <= 1000:
-            # Return a list containing a copy of the original sequence
-            chunk_copy = list(sequence)
-            if original_sequence_had_eos_at_end and eos_token_id is not None and (not chunk_copy or chunk_copy[-1] != eos_token_id):
-                if chunk_copy: # Should always be true if n > 0
-                    chunk_copy[-1] = eos_token_id
-            return [chunk_copy] if chunk_copy else []
-        elif n <= 1999:
-            num_chunks_to_make = 2
-        elif n <= 3000:
-            num_chunks_to_make = 3
-        else:
-            raise ValueError(f"Sequence too long ({n} tokens), max is 3000 for dynamic splitting.")
-
-        base_chunk_len = n // num_chunks_to_make
-        num_larger_chunks = n % num_chunks_to_make
-        
-        output_chunks = []
-        current_start_idx = 0
-        for i in range(num_chunks_to_make):
-            current_chunk_len = base_chunk_len + (1 if i < num_larger_chunks else 0)
-            if current_chunk_len == 0: # Should only happen if n=0, which is handled
-                continue
-            
-            chunk_end_idx = current_start_idx + current_chunk_len
-            new_chunk = list(sequence[current_start_idx : chunk_end_idx]) # Make a copy
-
-            if original_sequence_had_eos_at_end and eos_token_id is not None:
-                if not new_chunk: # Should not happen if current_chunk_len > 0
-                    pass
-                elif new_chunk[-1] != eos_token_id:
-                    new_chunk[-1] = eos_token_id # Replace last token with EOS
-            
-            if new_chunk: # Only add non-empty chunks
-                output_chunks.append(new_chunk)
-            current_start_idx = chunk_end_idx
-            
-        return output_chunks
-
     def tokenize_sequence(self, text: str, add_bos: bool = True, add_eos: bool = True) -> List[int]:
         if not CHAR_TO_ID or (add_bos and BOS_TOKEN not in CHAR_TO_ID) or \
            (add_eos and EOS_TOKEN not in CHAR_TO_ID) or UNK_TOKEN not in CHAR_TO_ID or PAD_TOKEN not in CHAR_TO_ID:
@@ -352,8 +285,11 @@ class OptimizedTrainer:
         pad_value = -100 if for_labels else CHAR_TO_ID.get(PAD_TOKEN)
         current_len = len(token_ids)
         if current_len > self.max_seq_len:
-            if not for_labels and token_ids[self.max_seq_len-1] != CHAR_TO_ID.get(EOS_TOKEN) and token_ids[-1] == CHAR_TO_ID.get(EOS_TOKEN):
-                 return token_ids[:self.max_seq_len-1] + [CHAR_TO_ID[EOS_TOKEN]]
+            # If truncating, ensure EOS is at the end if it was intended to be
+            # This logic should mostly be handled by _prepare_single_qa_pair_for_lm_training now
+            if not for_labels and CHAR_TO_ID.get(EOS_TOKEN) is not None:
+                if token_ids[-1] == CHAR_TO_ID.get(EOS_TOKEN) and token_ids[self.max_seq_len-1] != CHAR_TO_ID.get(EOS_TOKEN):
+                    return token_ids[:self.max_seq_len-1] + [CHAR_TO_ID[EOS_TOKEN]]
             return token_ids[:self.max_seq_len]
         return token_ids + [pad_value] * (self.max_seq_len - current_len)
 
@@ -368,6 +304,75 @@ class OptimizedTrainer:
             if token_id_val != bos_id: text_chars.append(ID_TO_CHAR.get(token_id_val, UNK_TOKEN))
         return "".join(text_chars)
 
+    def _prepare_single_qa_pair_for_lm_training(self, user_content: str, assistant_content: str, verbose_arg: bool) -> Optional[Tuple[List[int], List[int]]]:
+        """
+        Prepares a single user-assistant conversation pair into input_ids and labels
+        for language model training, respecting max_seq_len and applying causal masking.
+        verbose_arg: Explicitly passed verbose flag for use in threaded context.
+        """
+        
+        # Tokenize parts
+        user_part_tokens = self.tokenize_sequence(f"User: {user_content}", add_bos=False, add_eos=False)
+        bitzero_prefix_tokens = self.tokenize_sequence(" BitZero: ", add_bos=False, add_eos=False) # Note the leading space
+        assistant_part_tokens = self.tokenize_sequence(assistant_content, add_bos=False, add_eos=False)
+
+        # Construct the full sequence of token IDs
+        # Includes BOS, user_part, EOS (after user), BitZero_prefix, assistant_part, EOS (after assistant)
+        input_ids_full_composition = [CHAR_TO_ID[BOS_TOKEN]] + user_part_tokens + [CHAR_TO_ID[EOS_TOKEN]] + \
+                                     bitzero_prefix_tokens + assistant_part_tokens + [CHAR_TO_ID[EOS_TOKEN]]
+        
+        # Calculate the length of the prompt part for causal masking
+        # This includes everything up to, and including, the " BitZero: " prefix
+        prompt_len_for_masking = (1 + # BOS
+                                  len(user_part_tokens) + 
+                                  1 + # EOS after user
+                                  len(bitzero_prefix_tokens))
+        
+        # Handle truncation if the full sequence exceeds max_seq_len
+        # We truncate from the right (end) to keep the beginning of the prompt and as much of the answer as possible.
+        if len(input_ids_full_composition) > self.max_seq_len:
+            input_ids_final = input_ids_full_composition[:self.max_seq_len]
+            
+            # If truncation cut into the prompt part, adjust prompt_len_for_masking
+            # It's crucial that the prompt part is never entirely removed if it's the start of the sequence.
+            # We want to ensure at least MIN_TARGET_LEN_FOR_TRAINING tokens are left for the target.
+            prompt_len_for_masking = min(prompt_len_for_masking, len(input_ids_final) - self.MIN_TARGET_LEN_FOR_TRAINING)
+            prompt_len_for_masking = max(0, prompt_len_for_masking) # Cannot be negative
+            
+            # Ensure the truncated sequence still ends with EOS if it was supposed to
+            if CHAR_TO_ID.get(EOS_TOKEN) is not None and input_ids_final[-1] != CHAR_TO_ID.get(EOS_TOKEN):
+                if len(input_ids_final) > 1: # Only replace if there's space
+                    input_ids_final[-1] = CHAR_TO_ID.get(EOS_TOKEN)
+                elif self.max_seq_len >= 1: # If seq_len is 1, just be EOS
+                    input_ids_final = [CHAR_TO_ID.get(EOS_TOKEN)]
+                else: # Cannot fit even EOS
+                    return None 
+            
+        else:
+            input_ids_final = input_ids_full_composition # No truncation needed
+
+        # Create labels with causal masking: -100 for prompt, actual tokens for target
+        labels_final = [-100] * prompt_len_for_masking + input_ids_final[prompt_len_for_masking:]
+        
+        # Apply final padding to `max_seq_len` (only padding, no more truncation here)
+        input_ids_padded = self.pad_sequence(input_ids_final, for_labels=False)
+        labels_padded = self.pad_sequence(labels_final, for_labels=True)
+
+        # Final sanity checks
+        if len(input_ids_padded) != self.max_seq_len or len(labels_padded) != self.max_seq_len:
+            if verbose_arg: # Use verbose_arg here
+                print(f"Skipping pair: final length mismatch after padding. Input {len(input_ids_padded)}, Labels {len(labels_padded)}, MaxSeq {self.max_seq_len}")
+            return None
+        
+        num_actual_labels = sum(1 for x in labels_padded if x != -100)
+        if num_actual_labels < self.MIN_TARGET_LEN_FOR_TRAINING:
+            if verbose_arg: # Use verbose_arg here
+                print(f"Skipping pair: too few actual labels ({num_actual_labels} < {self.MIN_TARGET_LEN_FOR_TRAINING}) after processing. Likely prompt too long for meaningful answer.")
+            return None
+
+        return input_ids_padded, labels_padded
+
+
     def _load_full_dataset_once(self):
         if self.dataset_path and not self.full_dataset_cache:
             print(f"Loading dataset from {self.dataset_path} for the first time...")
@@ -378,30 +383,60 @@ class OptimizedTrainer:
                         try: raw_dataset.append(json.loads(line))
                         except json.JSONDecodeError as e: print(f"Skipping invalid JSON line: {line.strip()} - Error: {e}")
                 print(f"Loaded {len(raw_dataset)} raw items from {self.dataset_path}")
-                for item in raw_dataset:
-                    prepared_item = self.prepare_data_for_model(item)
-                    if prepared_item: self.full_dataset_cache.append(prepared_item)
-                print(f"Successfully prepared {len(self.full_dataset_cache)} items for training.")
-            except Exception as e: print(f"Error loading dataset: {e}"); self.full_dataset_cache = []
-        elif not self.dataset_path: print("No dataset_path provided. Dynamic task generation will be used if enabled.")
+                
+                prepared_items = []
+                with ThreadPoolExecutor(max_workers=os.cpu_count() or 1) as executor:
+                    # Pass self.verbose (the value from __init__) as an explicit argument
+                    futures = [executor.submit(self.prepare_data_for_model, item, self.verbose) for item in raw_dataset]
+                    for future in tqdm(as_completed(futures), total=len(raw_dataset), desc="Preparing dataset items"):
+                        result = future.result()
+                        if result: # Only add if preparation was successful
+                            prepared_items.append(result)
+
+                self.full_dataset_cache = prepared_items
+                print(f"Successfully prepared {len(self.full_dataset_cache)} valid items for training.")
+            except Exception as e: 
+                print(f"Error loading dataset: {e}"); 
+                self.full_dataset_cache = []
+        elif not self.dataset_path: 
+            print("No dataset_path provided. Dynamic task generation will be used if enabled.")
 
 
-    def prepare_data_for_model(self, dataset_item: Dict[str, Any]) -> Optional[Tuple[str, str, Any, str]]:
+    def prepare_data_for_model(self, dataset_item: Dict[str, Any], verbose_arg: bool) -> Optional[Tuple[List[int], List[int], Any, str]]:
+        """
+        Prepares a single dataset item (conversation pair) for model training,
+        including tokenization, padding/truncation, and label masking.
+        Returns input_ids, labels, expected_answer_for_verifier, task_type.
+        verbose_arg: Explicitly passed verbose flag for use in threaded context.
+        """
         try:
             task_type = dataset_item['type']
             conversation = dataset_item.get('conversation')
             if not isinstance(conversation, list) or len(conversation) < 2:
+                if verbose_arg: print(f"Skipping item: conversation not list or too short: {dataset_item.get('conversation')}")
                 return None
             
             user_turn, assistant_turn = conversation[0], conversation[1]
             if user_turn.get('role') != 'user' or assistant_turn.get('role') != 'assistant':
+                if verbose_arg: print(f"Skipping item: roles not user/assistant: {user_turn.get('role')}, {assistant_turn.get('role')}")
                 return None
 
             user_content = user_turn.get('content')
             assistant_content = assistant_turn.get('content')
             if not user_content or not assistant_content: 
+                if verbose_arg: print(f"Skipping item: empty user/assistant content: '{user_content}', '{assistant_content}'")
                 return None
             
+            # Call the dedicated preparation helper for LM training format
+            prepared_tokens = self._prepare_single_qa_pair_for_lm_training(user_content, assistant_content, verbose_arg)
+            if prepared_tokens is None:
+                return None # Indicate that this pair cannot be prepared for training
+            
+            input_ids, labels = prepared_tokens
+
+            # Expected answer for verifier (still needed for evaluation/difficulty adjustment with dynamic tasks)
+            # For pre-loaded datasets, this might be redundant if the verification logic isn't used
+            # but it's kept for consistency in the data structure.
             expected_answer_for_verifier = dataset_item.get('metadata', {}).get('expected_answer')
             if expected_answer_for_verifier is None: 
                 if task_type == "math":
@@ -409,8 +444,10 @@ class OptimizedTrainer:
                     except ValueError: expected_answer_for_verifier = assistant_content 
                 elif task_type == "code":
                     expected_answer_for_verifier = dataset_item.get('metadata', {}).get('expected_answer', assistant_content)
-            return user_content, assistant_content, expected_answer_for_verifier, task_type
-        except Exception: 
+            
+            return input_ids, labels, expected_answer_for_verifier, task_type
+        except Exception as e: 
+            if verbose_arg: print(f"Error preparing data item: {e}. Item: {dataset_item.get('conversation', 'N/A')[:50]}...")
             return None
 
 
@@ -425,182 +462,105 @@ class OptimizedTrainer:
             else: print("Dataset is empty or failed to load.")
         elif num_dynamic_tasks_to_generate > 0 : 
             print(f"Pre-generating {num_dynamic_tasks_to_generate} dynamic tasks for epoch...")
+            
+            prepared_dynamic_tasks = []
             if self.use_parallel_tasks:
                 with ThreadPoolExecutor(max_workers=min(4, os.cpu_count() or 1)) as executor:
-                    future_tasks = [executor.submit(self.task_generator.generate_task) for _ in range(num_dynamic_tasks_to_generate)]
-                    temp_dynamic_tasks = [future.result() for future in tqdm(as_completed(future_tasks), total=num_dynamic_tasks_to_generate, desc="Caching dynamic tasks")]
-            else:
-                temp_dynamic_tasks = [self.task_generator.generate_task() for _ in tqdm(range(num_dynamic_tasks_to_generate), desc="Caching dynamic tasks (seq)")]
+                    # Submit raw task generation, then wrap the preparation of the returned tuple
+                    future_raw_tasks = [executor.submit(self.task_generator.generate_task) for _ in range(num_dynamic_tasks_to_generate)]
+                    for future in tqdm(as_completed(future_raw_tasks), total=num_dynamic_tasks_to_generate, desc="Caching dynamic tasks"):
+                        task_desc, exp_ans_data, task_type_dyn = future.result()
+                        
+                        actual_assistant_content_for_lm = None
+                        if task_type_dyn == "code" and isinstance(exp_ans_data, dict) and "solution" in exp_ans_data:
+                            actual_assistant_content_for_lm = exp_ans_data["solution"]
+                        elif task_type_dyn == "math":
+                            actual_assistant_content_for_lm = str(exp_ans_data) # Convert math answer to string
+                        else:
+                            # Fallback if task_type_dyn isn't 'code' or 'math' or no solution/answer is extractable
+                            actual_assistant_content_for_lm = "Okay." 
+                        
+                        if actual_assistant_content_for_lm:
+                            # Pass self.verbose to the preparation function
+                            prepared_item = self._prepare_single_qa_pair_for_lm_training(task_desc, actual_assistant_content_for_lm, self.verbose)
+                            if prepared_item:
+                                # Append input_ids, labels, and also verifier_data for stat tracking
+                                prepared_dynamic_tasks.append((prepared_item[0], prepared_item[1], exp_ans_data, task_type_dyn))
+            else: # Sequential task generation for non-parallel
+                for _ in tqdm(range(num_dynamic_tasks_to_generate), desc="Caching dynamic tasks (seq)"):
+                    task_desc, exp_ans_data, task_type_dyn = self.task_generator.generate_task()
+                    actual_assistant_content_for_lm = None
+                    if task_type_dyn == "code" and isinstance(exp_ans_data, dict) and "solution" in exp_ans_data:
+                        actual_assistant_content_for_lm = exp_ans_data["solution"]
+                    elif task_type_dyn == "math":
+                        actual_assistant_content_for_lm = str(exp_ans_data)
+                    else:
+                        actual_assistant_content_for_lm = "Okay." # Fallback
+
+                    if actual_assistant_content_for_lm:
+                        # Pass self.verbose to the preparation function
+                        prepared_item = self._prepare_single_qa_pair_for_lm_training(task_desc, actual_assistant_content_for_lm, self.verbose)
+                        if prepared_item:
+                            prepared_dynamic_tasks.append((prepared_item[0], prepared_item[1], exp_ans_data, task_type_dyn))
             
-            for task_desc, exp_ans_data, task_type_dyn in temp_dynamic_tasks:
-                self.task_cache.append((task_desc, None, exp_ans_data, task_type_dyn))
-            print(f"Dynamic task cache filled with {len(self.task_cache)} tasks for epoch.")
-        else: print("No dataset path and no dynamic tasks requested for epoch.")
+            self.task_cache = prepared_dynamic_tasks
+            print(f"Dynamic task cache filled with {len(self.task_cache)} prepared tasks for epoch.")
+        else: 
+            print("No dataset path and no dynamic tasks requested for epoch.")
         self.debug_batch_printed_this_epoch = False
 
-    def get_next_task_from_cache(self) -> Optional[Tuple[str, Optional[str], Any, str]]:
+    def get_next_task_from_cache(self) -> Optional[Tuple[List[int], List[int], Any, str]]:
+        """
+        Retrieves the next prepared task (input_ids, labels, verifier_data, task_type) from cache.
+        """
         return self.task_cache.pop(0) if self.task_cache else None
 
-    def train_batch(self, batch_data: List[Tuple[str, Optional[str], Any, str]], current_epoch: int, current_batch_idx: int, verbose: bool) -> Dict[str, Any]:
-        prompts_original_text = [data[0] for data in batch_data]
-        # expected_answers_data_for_verifier = [data[2] for data in batch_data] # Not directly used in this SFT loss
-        # task_types = [data[3] for data in batch_data] # For potential type-specific logic or logging
+    def train_batch(self, batch_data: List[Tuple[List[int], List[int], Any, str]], current_epoch: int, current_batch_idx: int, verbose: bool) -> Dict[str, Any]:
+        """
+        Processes a batch of pre-tokenized, pre-labeled data for training.
+        `batch_data` is expected to be a list of (input_ids, labels, verifier_data, task_type) tuples.
+        """
+        
+        input_ids_list = [item[0] for item in batch_data]
+        labels_list = [item[1] for item in batch_data]
+        task_types = [item[3] for item in batch_data] # For potential type-specific loss tracking
         
         self.model.train() 
         self.optimizer.zero_grad(set_to_none=True)
         
-        batch_input_token_ids = []
-        batch_target_token_ids_for_loss = []
-        
-        MIN_PROMPT_LEN = 10 
-        MIN_TARGET_LEN = 3  
-
-        for i in range(len(prompts_original_text)):
-            task_prompt_text = prompts_original_text[i]
-            target_text_full_for_loss = batch_data[i][1] 
-
-            if not task_prompt_text or not target_text_full_for_loss:
-                if verbose: print(f"Skipping item {i} due to empty raw prompt ('{task_prompt_text[:30]}...') or target ('{str(target_text_full_for_loss)[:30]}...').")
-                continue
-
-            # Tokenize prompt and full target separately first
-            prompt_tokens_original = self.tokenize_sequence(task_prompt_text, add_bos=True, add_eos=False)
-            # Target for splitting and labeling should include EOS.
-            target_tokens_full = self.tokenize_sequence(target_text_full_for_loss, add_bos=False, add_eos=True) 
-
-            if len(prompt_tokens_original) < MIN_PROMPT_LEN:
-                if verbose: print(f"Skipping item {i} due to too short original prompt tokens ({len(prompt_tokens_original)}) for prompt: {task_prompt_text[:60]}...")
-                continue
-            if len(target_tokens_full) < MIN_TARGET_LEN:
-                if verbose: print(f"Skipping item {i} due to too short full target tokens ({len(target_tokens_full)}) for target: {target_text_full_for_loss[:60]}...")
-                continue
-            
-            current_prompt_tokens = list(prompt_tokens_original) # Work with a copy
-
-            # Step 1: If prompt is too long to even allow a minimal target, truncate prompt.
-            max_allowable_prompt_len_for_min_target = self.max_seq_len - MIN_TARGET_LEN
-            if len(current_prompt_tokens) > max_allowable_prompt_len_for_min_target:
-                if verbose: print(f"Item {i}: Original prompt too long ({len(current_prompt_tokens)}). Truncating prompt to fit minimal target.")
-                if current_prompt_tokens[0] == CHAR_TO_ID.get(BOS_TOKEN) and max_allowable_prompt_len_for_min_target > 1:
-                    # Keep BOS, take the tail end of the rest
-                    current_prompt_tokens = [CHAR_TO_ID.get(BOS_TOKEN)] + current_prompt_tokens[-(max_allowable_prompt_len_for_min_target-1):]
-                elif max_allowable_prompt_len_for_min_target > 0 :
-                    current_prompt_tokens = current_prompt_tokens[-max_allowable_prompt_len_for_min_target:]
-                else: 
-                    if verbose: print(f"Skipping item {i}: Prompt cannot be truncated enough to fit minimal target (max_allowable_prompt_len_for_min_target={max_allowable_prompt_len_for_min_target}).")
-                    continue
-            
-            if len(current_prompt_tokens) < MIN_PROMPT_LEN:
-                if verbose: print(f"Skipping item {i}: Prompt became too short ({len(current_prompt_tokens)}) after ensuring space for minimal target.")
-                continue
-
-            # Step 2: Determine space for target chunks and split the full target sequence.
-            effective_max_len_for_a_target_chunk = self.max_seq_len - len(current_prompt_tokens)
-
-            if effective_max_len_for_a_target_chunk < MIN_TARGET_LEN:
-                if verbose: print(f"Skipping item {i}: Prompt ({len(current_prompt_tokens)}) too long, not enough space ({effective_max_len_for_a_target_chunk}) for min target chunk ({MIN_TARGET_LEN}).")
-                continue
-
-            try:
-                # _split_sequence_dynamically uses its internal length rules (1000/2000/3000) on target_tokens_full
-                target_chunks_for_labeling = self._split_sequence_dynamically(target_tokens_full)
-            except ValueError as e: 
-                if verbose: print(f"Skipping item {i} due to target splitting error: {e}")
-                continue
-            except TypeError as e: # Catch if sequence is not a list
-                if verbose: print(f"Skipping item {i} due to target splitting type error: {e}")
-                continue
-            
-            for chunk_idx, target_chunk_labels in enumerate(target_chunks_for_labeling):
-                if not target_chunk_labels: # Skip empty chunks from splitter
-                    if verbose: print(f"Item {i}, chunk {chunk_idx}: Skipping empty chunk from splitter.")
-                    continue
-                if len(target_chunk_labels) < MIN_TARGET_LEN: 
-                    if verbose: print(f"Item {i}, chunk {chunk_idx}: Skipping sub-chunk as it's too short ({len(target_chunk_labels)}).")
-                    continue
-
-                current_target_chunk_for_input = list(target_chunk_labels) # Work with a copy
-                
-                # Ensure THIS specific (prompt + target_chunk) fits.
-                if len(current_prompt_tokens) + len(current_target_chunk_for_input) > self.max_seq_len:
-                    if verbose: print(f"Item {i}, chunk {chunk_idx}: Prompt len {len(current_prompt_tokens)}, chunk len {len(current_target_chunk_for_input)} exceeds max_seq_len {self.max_seq_len}. Truncating chunk.")
-                    
-                    max_len_for_this_chunk_strictly = self.max_seq_len - len(current_prompt_tokens)
-                    
-                    if max_len_for_this_chunk_strictly < MIN_TARGET_LEN:
-                        if verbose: print(f"  Item {i}, chunk {chunk_idx}: Skipping chunk, not enough space ({max_len_for_this_chunk_strictly}) after prompt ({len(current_prompt_tokens)}).")
-                        continue
-                    
-                    # Truncate the chunk, preserving EOS if possible
-                    original_chunk_had_eos = current_target_chunk_for_input[-1] == CHAR_TO_ID.get(EOS_TOKEN)
-                    current_target_chunk_for_input = current_target_chunk_for_input[:max_len_for_this_chunk_strictly]
-                    
-                    if original_chunk_had_eos and len(current_target_chunk_for_input) > 0:
-                        if current_target_chunk_for_input[-1] != CHAR_TO_ID.get(EOS_TOKEN):
-                            current_target_chunk_for_input[-1] = CHAR_TO_ID.get(EOS_TOKEN)
-                    elif not current_target_chunk_for_input and max_len_for_this_chunk_strictly > 0 and original_chunk_had_eos:
-                        # Edge case: chunk became empty but there's space for EOS
-                         current_target_chunk_for_input = [CHAR_TO_ID.get(EOS_TOKEN)]
-
-
-                    if len(current_target_chunk_for_input) < MIN_TARGET_LEN: 
-                        if verbose: print(f"  Item {i}, chunk {chunk_idx}: Skipping chunk, became too short ({len(current_target_chunk_for_input)}) after specific truncation.")
-                        continue
-                
-                if not current_target_chunk_for_input: # Final check if chunk is empty
-                    if verbose: print(f"  Item {i}, chunk {chunk_idx}: Skipping chunk as it became empty after processing.")
-                    continue
-
-                input_sequence_tokens = current_prompt_tokens + current_target_chunk_for_input
-                labels_for_loss = [-100] * len(current_prompt_tokens) + current_target_chunk_for_input 
-
-                padded_input_sequence = self.pad_sequence(input_sequence_tokens, for_labels=False)
-                padded_labels_sequence = self.pad_sequence(labels_for_loss, for_labels=True)
-
-                if len(padded_input_sequence) != self.max_seq_len or len(padded_labels_sequence) != self.max_seq_len:
-                    if verbose: 
-                        print(f"CRITICAL PADDING/TRUNCATION MISMATCH for item {i} chunk {chunk_idx}:")
-                        print(f"  Max Seq Len: {self.max_seq_len}")
-                        print(f"  Prompt tokens len: {len(current_prompt_tokens)}")
-                        print(f"  Target chunk input tokens len: {len(current_target_chunk_for_input)}")
-                        print(f"  Combined input_sequence_tokens len: {len(input_sequence_tokens)}")
-                        print(f"  Padded input len: {len(padded_input_sequence)}")
-                        print(f"  Labels for loss len (before pad): {len(labels_for_loss)}")
-                        print(f"  Padded label len: {len(padded_labels_sequence)}")
-                    continue
-
-                batch_input_token_ids.append(padded_input_sequence)
-                batch_target_token_ids_for_loss.append(padded_labels_sequence)
-        
-        num_valid_items_for_loss = len(batch_input_token_ids)
+        num_valid_items_for_loss = len(input_ids_list)
 
         if num_valid_items_for_loss == 0: 
             return {"batch_size": 0, "batch_loss": 0, "math_loss_in_batch": 0, "code_loss_in_batch": 0, "difficulty": self.task_generator.current_difficulty, "current_lr": self.optimizer.param_groups[0]['lr']}
 
-        input_ids_tensor = torch.tensor(batch_input_token_ids, dtype=torch.long, device=self.device)
-        labels_tensor = torch.tensor(batch_target_token_ids_for_loss, dtype=torch.long, device=self.device)
+        input_ids_tensor = torch.tensor(input_ids_list, dtype=torch.long, device=self.device)
+        labels_tensor = torch.tensor(labels_list, dtype=torch.long, device=self.device)
         
         if verbose and not self.debug_batch_printed_this_epoch and num_valid_items_for_loss > 0:
-            print(f"\\n--- Debug Batch (Epoch {current_epoch}, Batch {current_batch_idx+1}, Current BS: {self.batch_size}, Valid Items: {num_valid_items_for_loss}) ---")
+            print(f"\n--- Debug Batch (Epoch {current_epoch}, Batch {current_batch_idx+1}, Current BS: {self.batch_size}, Valid Items: {num_valid_items_for_loss}) ---")
             for i_debug in range(min(2, input_ids_tensor.size(0))): 
+                # Find prompt_len for debug display based on -100 in labels
                 prompt_len_for_debug = 0
                 try:
+                    # Find first non -100 in labels, which marks the start of the target
                     first_target_idx = (labels_tensor[i_debug] != -100).nonzero(as_tuple=True)[0][0].item()
                     prompt_len_for_debug = first_target_idx
                 except IndexError: 
+                    # If no non -100 labels (e.g., all -100), treat as full prompt (though should be caught earlier)
                     prompt_len_for_debug = input_ids_tensor.size(1) 
                 
                 print(f"Example {i_debug+1} Input Tokens (first 40): {input_ids_tensor[i_debug, :40].tolist()}")
+                # Detokenize the prompt part
                 print(f"Example {i_debug+1} Input Detokenized (prompt part, approx {prompt_len_for_debug} tokens): '{self.detokenize(input_ids_tensor[i_debug, :prompt_len_for_debug])}'")
                 print(f"Example {i_debug+1} Label Tokens (first 40): {labels_tensor[i_debug, :40].tolist()}")
                 
+                # Detokenize the label content (assistant's part)
                 label_content_tokens_for_display = []
                 for tok_idx, tok_val in enumerate(labels_tensor[i_debug].tolist()):
-                    if tok_idx >= prompt_len_for_debug and tok_val != -100 and tok_val != CHAR_TO_ID.get(PAD_TOKEN):
-                        if tok_val == CHAR_TO_ID.get(EOS_TOKEN): 
-                            label_content_tokens_for_display.append(tok_val) # Include EOS for display if it's the actual label
-                            break 
+                    if tok_idx >= prompt_len_for_debug and tok_val != -100: # Only include actual labels
                         label_content_tokens_for_display.append(tok_val)
+                        if tok_val == CHAR_TO_ID.get(EOS_TOKEN): # Stop if EOS is the actual label
+                            break
                 print(f"Example {i_debug+1} Label Detokenized (target part): '{self.detokenize(torch.tensor(label_content_tokens_for_display))}'")
 
             print(f"  Tensor Shapes: input_ids: {input_ids_tensor.shape}, labels: {labels_tensor.shape}")
@@ -639,7 +599,7 @@ class OptimizedTrainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip_val)
                 self.optimizer.step()
             
-            if self.scheduler: # Corrected: self.scheduler
+            if self.scheduler: 
                 if self.scheduler.last_epoch < self.scheduler.total_steps -1: 
                     self.scheduler.step()
                     current_lr_for_tracking = self.scheduler.get_last_lr()[0]
@@ -653,15 +613,15 @@ class OptimizedTrainer:
 
             avg_math_loss_this_batch = 0 
             avg_code_loss_this_batch = 0
-            # Type-specific loss tracking would require passing task_types through the new chunking logic
-            # For now, these are placeholders.
+            # To track type-specific loss, you'd need to calculate per-item loss and then average based on task_types.
+            # This is left as a future enhancement to avoid over-complicating this core change.
 
         self.stats["episodes"] += num_valid_items_for_loss 
         self.stats["total_answers"] += num_valid_items_for_loss 
         if num_valid_items_for_loss > 0 : 
             self.stats["batch_losses"].append(batch_total_loss)
             self.stats["learning_rates"].append(current_lr_for_tracking)
-            self.stats["current_batch_sizes"].append(self.batch_size) # Log the batch size used for this effective batch
+            self.stats["current_batch_sizes"].append(self.batch_size) 
 
         if not self.dataset_path and len(self.stats["batch_losses"]) > 0 : 
             avg_recent_loss = np.mean(self.stats["batch_losses"][-10:])
@@ -682,13 +642,12 @@ class OptimizedTrainer:
               num_epochs: int = 1, 
               save_interval_batches: int = 20, 
               verbose: bool = True,
-              dynamic_batch_adjustment_interval_batches: int = 10 # How often to adjust batch size
+              dynamic_batch_adjustment_interval_batches: int = 10 
               ) -> Dict[str, Any]:
         
         if self.device == "cuda":
-            torch.cuda.empty_cache() # Clear cache at the beginning of training
+            torch.cuda.empty_cache() 
         
-        # Initial dynamic batch size adjustment before training starts
         if self.device == "cuda":
             self.batch_size = self.get_optimal_batch_size()
             print(f"Initial optimal batch size set to: {self.batch_size}")
@@ -703,33 +662,23 @@ class OptimizedTrainer:
         start_time = time.time()
         total_batches_processed_effectively = 0 
         
-        # Configure scheduler:
-        # Calculate estimated_batches_per_epoch based on current (potentially dynamic) batch_size
-        # This is still an estimate if batch_size continues to change.
-        if self.dataset_path and self.full_dataset_cache and self.batch_size > 0:
-            # Use initial_batch_size for a more stable total_steps calculation if dataset is primary
+        if self.dataset_path and self.full_dataset_cache and self.initial_batch_size > 0:
             estimated_batches_this_run_per_epoch = (len(self.full_dataset_cache) + self.initial_batch_size - 1) // self.initial_batch_size if self.initial_batch_size > 0 else 200
-        elif not self.dataset_path and self.batch_size > 0: # Dynamic tasks
-            # Heuristic: assume a certain number of task generation rounds * save_interval
-            # This part is tricky for dynamic tasks + dynamic BS.
-            # Let's use a more generous fixed estimate per epoch for dynamic mode if dataset not present.
-            estimated_batches_this_run_per_epoch = 200 # Arbitrary reasonable number of batches for an epoch of dynamic tasks
-        else: # Fallback if batch_size is 0 or dataset not loaded
-            estimated_batches_this_run_per_epoch = 100 # Fallback
+        elif not self.dataset_path and self.batch_size > 0: 
+            estimated_batches_this_run_per_epoch = 200 
+        else: 
+            estimated_batches_this_run_per_epoch = 100 
 
-        # We only configure the scheduler *once* if it's None or if total_steps_for_scheduler was not pre-set.
-        # If loading from a checkpoint, self.scheduler might already be populated.
         if self.scheduler is None and self.total_steps_for_scheduler is None:
              self._configure_scheduler_if_needed(num_epochs, estimated_batches_this_run_per_epoch)
-        elif self.scheduler is None and self.total_steps_for_scheduler is not None: # total_steps was pre-set (e.g. via args for a very specific run)
+        elif self.scheduler is None and self.total_steps_for_scheduler is not None: 
              self._configure_scheduler_if_needed(num_epochs, self.total_steps_for_scheduler // num_epochs if num_epochs > 0 else self.total_steps_for_scheduler)
 
 
         for epoch in range(1, num_epochs + 1):
             print(f"\n--- Epoch {epoch}/{num_epochs} ---")
             
-            # Optionally adjust batch size at the start of each epoch (or more frequently)
-            if self.device == "cuda" and epoch > 1 : # Skip for first epoch if already set
+            if self.device == "cuda" and epoch > 1 : 
                 new_bs = self.get_optimal_batch_size()
                 if new_bs != self.batch_size:
                     print(f"Epoch {epoch}: Optimal batch size adjusted from {self.batch_size} to {new_bs}")
@@ -743,28 +692,25 @@ class OptimizedTrainer:
 
             if not self.task_cache: print(f"No tasks for epoch {epoch}. Skipping."); continue
 
-            # Use current self.batch_size for calculating num_batches_this_epoch
             num_batches_this_epoch = (len(self.task_cache) + self.batch_size - 1) // self.batch_size
             
-            if self.scheduler is None and not self.dataset_path: # If scheduler still not set (dynamic mode, first epoch)
+            if self.scheduler is None and not self.dataset_path: 
                 self._configure_scheduler_if_needed(num_epochs, num_batches_this_epoch)
 
             for batch_idx in range(num_batches_this_epoch):
-                # Dynamic batch size adjustment more frequently within an epoch
                 if self.device == "cuda" and (total_batches_processed_effectively + 1) % dynamic_batch_adjustment_interval_batches == 0 and total_batches_processed_effectively > 0:
                     new_bs = self.get_optimal_batch_size()
                     if new_bs != self.batch_size:
                         print(f"Batch {total_batches_processed_effectively + 1}: Optimal batch size adjusted from {self.batch_size} to {new_bs}")
                         self.batch_size = new_bs
-                        # If batch size changes, the remaining number of batches in this epoch might change.
-                        # For simplicity, we don't re-calculate num_batches_this_epoch mid-epoch.
-                        # The loop will continue, but `get_next_task_from_cache` will pull `self.batch_size` items.
                 
                 batch_start_time = time.time()
-                # Fetch items according to the current self.batch_size
                 current_batch_tasks_data = [self.get_next_task_from_cache() for _ in range(self.batch_size) if self.task_cache]
                 if not current_batch_tasks_data: break 
                 
+                # Filter out any None values if _prepare_single_qa_pair_for_lm_training returned None for some items
+                current_batch_tasks_data = [item for item in current_batch_tasks_data if item is not None]
+
                 batch_metrics = self.train_batch(current_batch_tasks_data, epoch, batch_idx, verbose) 
                 
                 if batch_metrics["batch_size"] > 0: 
@@ -796,7 +742,6 @@ class OptimizedTrainer:
             self.stats["current_epoch_for_plot"] = epoch 
             self._plot_training_progress()
         
-        # ... (final_stats and printing remain largely the same) ...
         final_stats = {
             "total_items_processed": self.stats["episodes"],
             "final_difficulty_dynamic_gen": self.task_generator.current_difficulty,
@@ -822,9 +767,19 @@ class OptimizedTrainer:
         return final_stats
 
     def save_checkpoint(self, checkpoint_path: str):
-        # ... (save_checkpoint method content largely same, ensure scheduler_state_dict is saved)
         model_device = next(self.model.parameters()).device
         self.model.cpu() 
+
+        # --- START OF PROPOSED CHANGE: Limit stats history ---
+        HISTORY_LENGTH = 500 # Keep data for the last 500 batches/items for plots/summary
+
+        for key in ["rewards", "difficulties", "batch_times", "memory_usage", 
+                     "batch_losses", "learning_rates", "current_batch_sizes",
+                     "math_batch_losses", "code_batch_losses"]:
+            if key in self.stats and isinstance(self.stats[key], list):
+                self.stats[key] = self.stats[key][-HISTORY_LENGTH:]
+        # --- END OF PROPOSED CHANGE ---
+
         checkpoint = {
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
@@ -832,7 +787,7 @@ class OptimizedTrainer:
             "scaler_state_dict": self.scaler.state_dict() if self.scaler else None, 
             "stats": self.stats, 
             "task_generator_difficulty": self.task_generator.current_difficulty,
-            "initial_batch_size_config": self.initial_batch_size, # Save config
+            "initial_batch_size_config": self.initial_batch_size, 
             "tokenizer_config": { 
                 "VOCAB_SIZE": VOCAB_SIZE, "CHAR_TO_ID_items": list(CHAR_TO_ID.items()), 
                 "ID_TO_CHAR_items": list(ID_TO_CHAR.items()), "PAD_TOKEN": PAD_TOKEN, 
@@ -844,7 +799,6 @@ class OptimizedTrainer:
         self.model.to(model_device) 
         
         stats_summary_path = checkpoint_path.replace(".pt", "_stats_summary.json")
-        # ... (summary stats saving is same) ...
         avg_loss_overall = np.mean(self.stats["batch_losses"]) if self.stats["batch_losses"] else float('inf')
         summary_stats_to_save = {
             "items_processed": self.stats["episodes"], 
@@ -853,7 +807,7 @@ class OptimizedTrainer:
             "rewards_last_100_items": self.stats["rewards"][-100:], 
             "losses_last_100_batches": self.stats["batch_losses"][-100:],
             "learning_rates_last_100_batches": self.stats["learning_rates"][-100:], 
-            "batch_sizes_last_100_batches": self.stats["current_batch_sizes"][-100:], # Add batch sizes to summary
+            "batch_sizes_last_100_batches": self.stats["current_batch_sizes"][-100:], 
             "batch_times_last_100": self.stats["batch_times"][-100:],
             "quantization_stats": self.model.get_quantization_stats()
         }
@@ -865,7 +819,6 @@ class OptimizedTrainer:
         print(f"Stats summary saved to {stats_summary_path}")
 
     def load_checkpoint(self, checkpoint_path: str):
-        # ... (load_checkpoint method content largely same, ensure scheduler_state_dict is loaded if exists)
         print(f"Loading checkpoint from {checkpoint_path}")
         try:
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -878,14 +831,10 @@ class OptimizedTrainer:
             self.model.load_state_dict(checkpoint["model_state_dict"])
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             
-            # Batch size from checkpoint if it was saved as part of config (e.g., initial_batch_size)
             self.initial_batch_size = checkpoint.get("initial_batch_size_config", self.initial_batch_size)
-            self.batch_size = self.initial_batch_size # Reset to initial, get_optimal_batch_size will adjust
+            self.batch_size = self.initial_batch_size 
             
             if "scheduler_state_dict" in checkpoint and checkpoint["scheduler_state_dict"] is not None:
-                # Scheduler needs to be configured with total_steps before loading its state.
-                # This is tricky if total_steps for the new run is different.
-                # For now, we assume if state is there, we try to load. A full re-init might be safer if run params change.
                 if self.scheduler is None and self.total_steps_for_scheduler is not None and self.total_steps_for_scheduler > 0:
                      self._configure_scheduler_if_needed(self.num_epochs_for_scheduler, self.total_steps_for_scheduler // self.num_epochs_for_scheduler if self.num_epochs_for_scheduler > 0 else self.total_steps_for_scheduler)
                 
@@ -899,7 +848,6 @@ class OptimizedTrainer:
                 self.scaler.load_state_dict(checkpoint["scaler_state_dict"])
             
             self.stats = checkpoint.get("stats", self.stats) 
-            # Ensure new stats keys are present
             if "current_batch_sizes" not in self.stats: self.stats["current_batch_sizes"] = []
 
             self.task_generator.current_difficulty = checkpoint.get("task_generator_difficulty", self.task_generator.current_difficulty)
@@ -908,7 +856,6 @@ class OptimizedTrainer:
         except Exception as e: print(f"Error loading checkpoint: {e}.");
 
     def _plot_training_progress(self):
-        # ... (plotting logic largely same, can add plot for dynamic batch size if desired)
         if not self.stats["batch_losses"]: 
             print("No batch loss data to plot.")
             return
@@ -919,11 +866,11 @@ class OptimizedTrainer:
             return
 
         num_subplots = 1 
-        if self.stats["math_batch_losses"]: num_subplots += 1
-        if self.stats["code_batch_losses"]: num_subplots += 1
-        if self.stats["batch_times"]: num_subplots += 1
-        if self.stats["learning_rates"]: num_subplots +=1 
-        if self.stats["current_batch_sizes"]: num_subplots +=1 # For Batch Size plot
+        if self.stats["math_batch_losses"] and any(self.stats["math_batch_losses"]): num_subplots += 1
+        if self.stats["code_batch_losses"] and any(self.stats["code_batch_losses"]): num_subplots += 1
+        if self.stats["batch_times"] and any(self.stats["batch_times"]): num_subplots += 1
+        if self.stats["learning_rates"] and any(self.stats["learning_rates"]): num_subplots +=1 
+        if self.stats["current_batch_sizes"] and any(self.stats["current_batch_sizes"]): num_subplots +=1 
 
 
         fig, axes = plt.subplots(num_subplots, 1, figsize=(12, 4 * num_subplots), sharex=False)
@@ -944,9 +891,8 @@ class OptimizedTrainer:
         current_ax.legend(); current_ax.grid(True)
         
         # Plot Math Loss
-        if self.stats["math_batch_losses"] and ax_idx < len(axes):
+        if self.stats["math_batch_losses"] and any(self.stats["math_batch_losses"]) and ax_idx < len(axes):
             current_ax = axes[ax_idx]; ax_idx +=1
-            # ... (math loss plotting as before) ...
             num_math_loss_points = len(self.stats["math_batch_losses"])
             math_loss_indices = list(range(1, num_math_loss_points + 1))
             current_ax.plot(math_loss_indices, self.stats["math_batch_losses"], 'g-', alpha=0.7, label="Math Batch Loss")
@@ -958,9 +904,8 @@ class OptimizedTrainer:
             current_ax.set_title('Math Task Batch Loss'); current_ax.legend(); current_ax.grid(True)
 
         # Plot Code Loss
-        if self.stats["code_batch_losses"] and ax_idx < len(axes):
+        if self.stats["code_batch_losses"] and any(self.stats["code_batch_losses"]) and ax_idx < len(axes):
             current_ax = axes[ax_idx]; ax_idx +=1
-            # ... (code loss plotting as before) ...
             num_code_loss_points = len(self.stats["code_batch_losses"])
             code_loss_indices = list(range(1, num_code_loss_points + 1))
             current_ax.plot(code_loss_indices, self.stats["code_batch_losses"], 'm-', alpha=0.7, label="Code Batch Loss")
@@ -972,28 +917,26 @@ class OptimizedTrainer:
             current_ax.set_title('Code Task Batch Loss'); current_ax.legend(); current_ax.grid(True)
         
         # Plot Batch Times
-        if self.stats["batch_times"] and ax_idx < len(axes): 
+        if self.stats["batch_times"] and any(self.stats["batch_times"]) and ax_idx < len(axes): 
             current_ax = axes[ax_idx]; ax_idx +=1
-            # ... (batch time plotting as before) ...
             batch_indices_times = list(range(1, len(self.stats["batch_times"]) + 1))
             current_ax.plot(batch_indices_times, self.stats["batch_times"], 'c-')
             current_ax.set_xlabel('Batch Index'); current_ax.set_ylabel('Time (s)')
             current_ax.set_title('Batch Processing Time'); current_ax.grid(True)
         
         # Plot Learning Rates
-        if self.stats["learning_rates"] and ax_idx < len(axes):
+        if self.stats["learning_rates"] and any(self.stats["learning_rates"]) and ax_idx < len(axes):
             current_ax = axes[ax_idx]; ax_idx +=1
-            # ... (LR plotting as before) ...
             lr_indices = list(range(1, len(self.stats["learning_rates"]) + 1))
             current_ax.plot(lr_indices, self.stats["learning_rates"], 'y-')
             current_ax.set_xlabel('Batch Index'); current_ax.set_ylabel('Learning Rate')
             current_ax.set_title('Learning Rate Schedule'); current_ax.grid(True)
             
         # Plot Dynamic Batch Sizes
-        if self.stats["current_batch_sizes"] and ax_idx < len(axes):
+        if self.stats["current_batch_sizes"] and any(self.stats["current_batch_sizes"]) and ax_idx < len(axes):
             current_ax = axes[ax_idx]; ax_idx +=1
             bs_indices = list(range(1, len(self.stats["current_batch_sizes"]) + 1))
-            current_ax.plot(bs_indices, self.stats["current_batch_sizes"], 'p-', color='orange', label="Batch Size Used") # p for pentagon marker
+            current_ax.plot(bs_indices, self.stats["current_batch_sizes"], 'p-', color='orange', label="Batch Size Used") 
             current_ax.set_xlabel('Batch Index')
             current_ax.set_ylabel('Batch Size')
             current_ax.set_title('Effective Batch Size Over Training')
@@ -1011,9 +954,9 @@ def main():
     parser = argparse.ArgumentParser(description="BitZero Optimized Training with Optional Dataset")
     parser.add_argument("--model_size", type=str, default="nano", choices=["nano", "micro"], help="Model size")
     parser.add_argument("--device", type=str, default=None, help="Device (cuda or cpu). Auto-detects if None.")
-    parser.add_argument("--initial_batch_size", type=int, default=8, help="Initial batch size (can be dynamic on CUDA)") # Changed name
+    parser.add_argument("--initial_batch_size", type=int, default=8, help="Initial batch size (can be dynamic on CUDA)")
     parser.add_argument("--max_dynamic_batch_size", type=int, default=32, help="Max cap for dynamic batch sizing on CUDA")
-    parser.add_argument("--vram_per_sample_gb", type=float, default=0.2, help="Estimated VRAM in GB per sample for dynamic batch sizing") # Adjusted default
+    parser.add_argument("--vram_per_sample_gb", type=float, default=0.2, help="Estimated VRAM in GB per sample for dynamic batch sizing") 
     parser.add_argument("--dynamic_bs_adjust_interval", type=int, default=10, help="Adjust dynamic batch size every N batches")
 
 
@@ -1037,9 +980,9 @@ def main():
     
     trainer = OptimizedTrainer(
         model_size=args.model_size, device=selected_device, 
-        initial_batch_size=args.initial_batch_size, # Pass new arg
-        max_dynamic_batch_size=args.max_dynamic_batch_size, # Pass new arg
-        vram_per_sample_gb_estimate=args.vram_per_sample_gb, # Pass new arg
+        initial_batch_size=args.initial_batch_size, 
+        max_dynamic_batch_size=args.max_dynamic_batch_size, 
+        vram_per_sample_gb_estimate=args.vram_per_sample_gb, 
         learning_rate=args.learning_rate, max_seq_len=args.max_seq_len, 
         use_mixed_precision=not args.no_mixed_precision, 
         use_gradient_checkpointing=not args.no_gradient_checkpointing, 
@@ -1047,7 +990,8 @@ def main():
         use_parallel_tasks=not args.no_parallel_tasks, dataset_path=args.dataset_path,
         critical_ratio_for_model=args.critical_ratio,
         num_epochs_for_scheduler=args.epochs, 
-        weight_decay_for_adamw=args.weight_decay
+        weight_decay_for_adamw=args.weight_decay,
+        verbose=args.verbose # Pass the verbose flag
     )
     
     if args.checkpoint: 
@@ -1057,7 +1001,7 @@ def main():
         num_epochs=args.epochs, 
         save_interval_batches=args.save_interval_batches, 
         verbose=args.verbose,
-        dynamic_batch_adjustment_interval_batches=args.dynamic_bs_adjust_interval # Pass new arg
+        dynamic_batch_adjustment_interval_batches=args.dynamic_bs_adjust_interval 
     )
 
 if __name__ == "__main__":
