@@ -170,4 +170,14 @@ if __name__ == '__main__':
     assert "less_common" not in CHAR_TO_ID # Below threshold
     print(f"ID for 'new_keyword_sequence': {CHAR_TO_ID['new_keyword_sequence']}")
     print("Dynamic vocabulary adaptation test passed.")
+# In tokenizer_config.py or a new cell in Colab after importing from it
+from tokenizer_config import ID_TO_CHAR, CHAR_TO_ID, BOS_TOKEN, EOS_TOKEN, PAD_TOKEN, UNK_TOKEN
 
+print(f"Token ID 6: '{ID_TO_CHAR.get(6)}'")
+print(f"Token ID 72: '{ID_TO_CHAR.get(72)}'")
+
+# Also, verify your special token IDs again, just to be sure
+print(f"PAD_TOKEN ID: {CHAR_TO_ID[PAD_TOKEN]}") # Should be 0
+print(f"UNK_TOKEN ID: {CHAR_TO_ID[UNK_TOKEN]}") # Should be 1
+print(f"BOS_TOKEN ID: {CHAR_TO_ID[BOS_TOKEN]}") # Should be 2
+print(f"EOS_TOKEN ID: {CHAR_TO_ID[EOS_TOKEN]}") # Should be 3
