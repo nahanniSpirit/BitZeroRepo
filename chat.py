@@ -133,7 +133,7 @@ class BitZeroChat:
                 text_chars.append(ID_TO_CHAR.get(token_id_val, UNK_TOKEN))
         return "".join(text_chars)
 
-    def generate_response(self, user_input, max_new_tokens=150, temperature=0.7, top_k=40) -> Tuple[str, Optional[int]]:
+    def generate_response(self, user_input, max_new_tokens=150, temperature=1.0, top_k=80) -> Tuple[str, Optional[int]]:
         # 1. Store user input in memory manager
         user_turn_id = self.memory_manager.add_turn_to_conversation(
             conversation_session_id=self.conversation_id, 
@@ -173,12 +173,17 @@ class BitZeroChat:
         # To be absolutely sure the current user input is the last thing before "BitZero: ",
         # we can construct it carefully. The current get_recent_turns_for_prompt returns in chrono order.
         
-        # Re-construct prompt ensuring current user input is last before BitZero's turn
-        # This might duplicate the last user turn if already fetched by get_recent_turns_for_prompt
+        # Re-construct prompt ensuring current user input is last before BitZero's turn        # This might duplicate the last user turn if already fetched by get_recent_turns_for_prompt
         # A cleaner way is to ensure get_recent_turns_for_prompt doesn't include the *absolute* last user turn
         # if we are going to append it manually, or just rely on it being there.
         # For now, let's assume get_recent_turns includes the latest user turn if limit is sufficient.
-        prompt_text_for_model_input += f"BitZero: " # Prompt for model's response
+        prompt_text_for_model_input += f"BitZero: I think that " # Prompt for model's response with a starter phrase
+        
+        # Debug: Print the full prompt text being fed to the model
+        print(f"\n--- DEBUG: Full Prompt Text for Model ---")
+        print(f"'{prompt_text_for_model_input}'")  # Add quotes to see leading/trailing whitespace
+        print(f"--- END DEBUG: Full Prompt Text ---")
+        print(f"DEBUG: Length of prompt text: {len(prompt_text_for_model_input)}")
         
         generation_prompt_tokens = [CHAR_TO_ID.get(BOS_TOKEN)]
         for char in prompt_text_for_model_input: 
@@ -215,8 +220,16 @@ class BitZeroChat:
                     break
                 generated_ids_for_response.append(next_token_id_item)
                 current_input_ids = torch.cat([current_input_ids, next_token_id_tensor.view(1,1)], dim=1) 
-        
+          print(f"DEBUG: Raw generated token IDs for response: {generated_ids_for_response}")
         response = self.detokenize(torch.tensor(generated_ids_for_response, dtype=torch.long, device="cpu"))
+        
+        # Check for empty/whitespace-only responses
+        if not response.strip():  # If the response is empty or only whitespace
+            print("INFO: Model generated an empty/whitespace response. Not saving to history. Trying a fallback.")
+            response = "I'm not sure how to respond to that. Can you try rephrasing?"
+            # Or you could have it try to regenerate, but that might loop.
+            # For now, a fixed fallback is safer for testing.
+            # assistant_turn_id will still be generated for this fallback.
         
         # 5. Store model response
         assistant_turn_id = self.memory_manager.add_turn_to_conversation(
@@ -263,7 +276,7 @@ class BitZeroChat:
                 break
             if not user_input.strip(): continue
 
-            print("BitZero is thinking...")
+            print("Thinking...")
             start_time = time.time()
             response, assistant_turn_id = self.generate_response(user_input)
             elapsed_time = time.time() - start_time
