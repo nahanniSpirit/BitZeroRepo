@@ -220,7 +220,7 @@ class BitZeroChat:
                     break
                 generated_ids_for_response.append(next_token_id_item)
                 current_input_ids = torch.cat([current_input_ids, next_token_id_tensor.view(1,1)], dim=1) 
-          print(f"DEBUG: Raw generated token IDs for response: {generated_ids_for_response}")
+                print(f"DEBUG: Raw generated token IDs for response: {generated_ids_for_response}")
         response = self.detokenize(torch.tensor(generated_ids_for_response, dtype=torch.long, device="cpu"))
         
         # Check for empty/whitespace-only responses
